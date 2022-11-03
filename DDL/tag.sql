@@ -1,0 +1,5 @@
+CREATE TABLE tag (
+  id int NOT NULL AUTO_INCREMENT,
+  tag_name VARCHAR(20) NOT NULL,
+  PRIMARY KEY (id)
+)

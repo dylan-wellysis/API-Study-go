@@ -102,6 +102,10 @@ type CommentRequestData struct {
 	Comment CommentRequest `json:"comment"`
 }
 
+type TagResponseData struct {
+	Tags []string `json:"tags"`
+}
+
 func checkError(err error) {
 	if err != nil {
 		panic(err)
@@ -382,4 +386,22 @@ func handleComment(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
-func handleTag(w http.ResponseWriter, req *http.Request) {}
+func handleTag(w http.ResponseWriter, req *http.Request) {
+	// 전체 tag 쿼리
+	query := fmt.Sprintf("SELECT tag_name FROM tag")
+	rows, err := db.Query(query)
+	checkError(err)
+	defer rows.Close()
+
+	var tagList []string
+	for rows.Next() {
+		var tag_name string
+		err = rows.Scan(&tag_name)
+		tagList = append(tagList, tag_name)
+	}
+
+	var resData TagResponseData
+	resData.Tags = tagList
+
+	json.NewEncoder(w).Encode(resData)
+}
