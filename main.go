@@ -4,7 +4,7 @@ import (
 	"database/sql" // 실제 SQL을 수행할 패키지
 	"encoding/json"
 
-	// "errors"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -15,10 +15,11 @@ import (
 
 	"github.com/gosimple/slug"
 
-	_ "github.com/go-sql-driver/mysql" // driver는 개발자가 직접 쓰지 않으므로, 언더바로 alias를 준다
+	"github.com/go-sql-driver/mysql" // driver는 개발자가 직접 쓰지 않으므로, 언더바로 alias를 준다
 )
 
 var db *sql.DB // 전역변수로 설정 - 아직 더 나은 대안은 모르겠다..
+var mysqlErr *mysql.MySQLError
 
 // 전체 TODO: author following 개선
 func main() {
@@ -115,8 +116,6 @@ func checkError(err error) {
 	}
 }
 
-// TODO: favorite 조회하여 별도 기입
-// TODO: article 테이블에서 favorite 삭제
 func handleArticle(w http.ResponseWriter, req *http.Request) {
 	fmt.Println("Method : ", req.Method)
 
@@ -159,16 +158,17 @@ func handleArticle(w http.ResponseWriter, req *http.Request) {
 	var article_id int
 	var article ArticleRes
 	var temp_user_id int
-	article_err := db.QueryRow(query).Scan(&article_id, &article.Slug, &article.Title, &article.Desc, &article.Body, &article.CreatedAt, &article.UpdatedAt, &article.Favorited, &article.FavoritesCount, &temp_user_id)
+	article_err := db.QueryRow(query).Scan(&article_id, &article.Slug, &article.Title, &article.Desc, &article.Body, &article.CreatedAt, &article.UpdatedAt, &temp_user_id)
 
 	switch req.Method {
 	case "POST":
 
+		// TODO: 아래 article이 없을때의 조건을 바꾸자.(테이블의 slug가 unique조건임을 활용)
 		// article이 없다면 INSERT
 		if article_err == sql.ErrNoRows {
 			article.CreatedAt = time.Now()
 			article.UpdatedAt = article.CreatedAt
-			_, err = db.Exec("INSERT INTO article VALUES (?,?,?,?,?,?,?,?,?,?)",
+			_, err = db.Exec("INSERT INTO article VALUES (?,?,?,?,?,?,?,?)",
 				nil,
 				req_slug,
 				reqData.Article.Title,
@@ -176,14 +176,12 @@ func handleArticle(w http.ResponseWriter, req *http.Request) {
 				reqData.Article.Body,
 				article.CreatedAt,
 				article.UpdatedAt,
-				false, // favorited
-				0,     // favoritescount
 				user_id,
 			)
 			checkError(err)
 
 			// 추가된 article의 id를 조회
-			query = fmt.Sprintf("SELECT * FROM article WHERE slug='%s'", req_slug)
+			query = fmt.Sprintf("SELECT id FROM article WHERE slug='%s'", req_slug)
 			err = db.QueryRow(query).Scan(&article_id)
 			checkError(err)
 
@@ -241,8 +239,29 @@ func handleArticle(w http.ResponseWriter, req *http.Request) {
 		// tag 쿼리
 		tagList := getTags(article_id)
 
+		// TODO: Authentication 추가 후, 실제 user_id 입력
+		auth_user_id := 1
+		// user_id, article_id로 favorite 쿼리
+		query = fmt.Sprintf("SELECT user_id FROM favorite WHERE article_id='%d'", article_id)
+		var favorites_cnt int = 0
+		var temp_user_id int
+		var favorited bool = false
+		rows, err := db.Query(query)
+		defer rows.Close()
+		for rows.Next() {
+			err := rows.Scan(&temp_user_id)
+			if temp_user_id == auth_user_id {
+				favorited = true
+			}
+			checkError(err)
+			favorites_cnt += 1
+		}
+		checkError(err)
+
 		article.Author = author
 		article.TagList = tagList
+		article.Favorited = favorited
+		article.FavoritesCount = favorites_cnt
 		resData := &ArticleResponseData{Article: article}
 		json.NewEncoder(w).Encode(resData)
 		// w.Write([]byte("single article"))
@@ -262,12 +281,21 @@ func handleArticle(w http.ResponseWriter, req *http.Request) {
 		_, err = db.Exec(update_query, reqUpdateData.Article.Title, reqUpdateData.Article.Desc, reqUpdateData.Article.Body, req_slug, article_id)
 		checkError(err)
 	case "DELETE":
+		// article_tag에서 tag 관계도 삭제
+		_, err = db.Exec("DELETE FROM article_tag WHERE article_id=?", article_id)
+		checkError(err)
+
+		// favorite에서 관계도 삭제
+		_, err = db.Exec("DELETE FROM favorite WHERE article_id=?", article_id)
+		checkError(err)
+
+		// comment 삭제
+		_, err = db.Exec("DELETE FROM comment WHERE article_id=?", article_id)
+		checkError(err)
+
 		// article 삭제
 		_, err = db.Exec("DELETE FROM article WHERE id=?", article_id)
 		checkError(err)
-
-		// article_tag에서 tag 관계도 삭제
-		_, err = db.Exec("DELETE FROM article_tag WHERE article_id=?", article_id)
 	}
 }
 
@@ -284,7 +312,7 @@ func handleFavorite(w http.ResponseWriter, req *http.Request) {
 	var article_id int
 	var article ArticleRes
 	var temp_author_id int
-	err := db.QueryRow(query).Scan(&article_id, &article.Slug, &article.Title, &article.Desc, &article.Body, &article.CreatedAt, &article.UpdatedAt, &article.Favorited, &article.FavoritesCount, &temp_author_id)
+	err := db.QueryRow(query).Scan(&article_id, &article.Slug, &article.Title, &article.Desc, &article.Body, &article.CreatedAt, &article.UpdatedAt, &temp_author_id)
 	checkError(err)
 
 	// author 쿼리
@@ -294,7 +322,7 @@ func handleFavorite(w http.ResponseWriter, req *http.Request) {
 	checkError(err)
 
 	// article_id로 favoritesCount 쿼리
-	query = fmt.Sprintf("SELECT count(*) FROM favorite WHERE article_id='%d')", article_id)
+	query = fmt.Sprintf("SELECT count(*) FROM favorite WHERE article_id='%d'", article_id)
 	var favorites_cnt int
 	err = db.QueryRow(query).Scan(&favorites_cnt)
 	checkError(err)
@@ -313,15 +341,19 @@ func handleFavorite(w http.ResponseWriter, req *http.Request) {
 			user_id,
 			article_id,
 		)
-		checkError(err)
+		// DUPLICATED KEY error = 이미 favorite임
+		if errors.As(err, &mysqlErr) && mysqlErr.Number == 1062 {
+		} else {
+			favorites_cnt += 1
+		}
 
 		resData.Article.Favorited = true
-		resData.Article.FavoritesCount = favorites_cnt + 1
+		resData.Article.FavoritesCount = favorites_cnt
 		json.NewEncoder(w).Encode(resData)
 
 	case "DELETE":
 		// user_id 및 article_id로 favoritesCount 쿼리
-		query = fmt.Sprintf("SELECT count(*) FROM favorite WHERE user_id='%d' and article_id='%d')", user_id, article_id)
+		query = fmt.Sprintf("SELECT count(*) FROM favorite WHERE user_id='%d' and article_id='%d'", user_id, article_id)
 		var is_favorite int
 		err = db.QueryRow(query).Scan(&is_favorite)
 		checkError(err)
@@ -346,12 +378,10 @@ func handleComment(w http.ResponseWriter, req *http.Request) {
 	req_slug := vars["slug"]
 
 	// slug로 article 쿼리
-	// 복수의 rows를 받기 위해 Query()와 Next()를 사용
-	query := fmt.Sprintf("SELECT * FROM article WHERE slug='%s'", req_slug)
+	query := fmt.Sprintf("SELECT id, user_id FROM article WHERE slug='%s'", req_slug)
 	var article_id int
-	var article ArticleRes
 	var temp_user_id int
-	err := db.QueryRow(query).Scan(&article_id, &article.Slug, &article.Title, &article.Desc, &article.Body, &article.CreatedAt, &article.UpdatedAt, &article.Favorited, &article.FavoritesCount, &temp_user_id)
+	err := db.QueryRow(query).Scan(&article_id, &temp_user_id)
 	checkError(err)
 
 	switch req.Method {
@@ -440,11 +470,11 @@ func handleTag(w http.ResponseWriter, req *http.Request) {
 }
 
 func getTags(article_id ...int) []string {
-	var query string
+	var query string = "SELECT tag_name FROM tag"
 
 	if article_id != nil {
-		query = fmt.Sprintf("SELECT tag_id FROM article_tag WHERE article_id='%d'", article_id[0])
-		temp_rows, err := db.Query(query)
+		temp_query := fmt.Sprintf("SELECT tag_id FROM article_tag WHERE article_id='%d'", article_id[0])
+		temp_rows, err := db.Query(temp_query)
 		checkError(err)
 		defer temp_rows.Close()
 
@@ -455,11 +485,11 @@ func getTags(article_id ...int) []string {
 			checkError(err)
 			tagIdList = append(tagIdList, strconv.Itoa(tag_id)) // int to string 변환이 특이하다..
 		}
-		tagIds := strings.Join(tagIdList, ",")
+		if len(tagIdList) > 0 {
+			tagIds := strings.Join(tagIdList, ",")
 
-		query = fmt.Sprintf("SELECT tag_name FROM tag WHERE id in (%s)", tagIds)
-	} else {
-		query = "SELECT tag_name FROM tag"
+			query = fmt.Sprintf("SELECT tag_name FROM tag WHERE id in (%s)", tagIds)
+		}
 	}
 
 	rows, err := db.Query(query)
