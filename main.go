@@ -17,6 +17,7 @@ import (
 
 var db *sql.DB // 전역변수로 설정 - 아직 더 나은 대안은 모르겠다..
 
+// 전체 TODO: author following 개선
 func main() {
 	var err error
 	db, err = sql.Open("mysql", "dylan:mysql@tcp(172.17.0.4:3306)/go_server?parseTime=true") // mysql is on another container, in same network "bridge"
@@ -30,9 +31,15 @@ func main() {
 	r.HandleFunc("/api/articles/{slug}", handleArticle).Methods("GET")
 	r.HandleFunc("/api/articles/{slug}", handleArticle).Methods("PUT")
 	r.HandleFunc("/api/articles/{slug}", handleArticle).Methods("DELETE")
+
+	r.HandleFunc("/api/articles/{slug}/favorite", handleFavorite).Methods("POST")
+	r.HandleFunc("/api/articles/{slug}/favorite", handleFavorite).Methods("DELETE")
+
 	r.HandleFunc("/api/articles/{slug}/comments", handleComment).Methods("POST")
 	r.HandleFunc("/api/articles/{slug}/comments", handleComment).Methods("GET")
 	r.HandleFunc("/api/articles/{slug}/comments/{id}", handleComment).Methods("DELETE")
+
+	r.HandleFunc("/api/tags", handleTag).Methods("GET")
 
 	server := &http.Server{Addr: ":8080", Handler: r}
 	server.ListenAndServe()
@@ -101,6 +108,8 @@ func checkError(err error) {
 	}
 }
 
+// TODO: favorite 조회하여 별도 기입
+// TODO: article 테이블에서 favorite 삭제
 func handleArticle(w http.ResponseWriter, req *http.Request) {
 	fmt.Println("Method : ", req.Method)
 
@@ -214,6 +223,75 @@ func handleArticle(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
+func handleFavorite(w http.ResponseWriter, req *http.Request) {
+	fmt.Println("Method : ", req.Method)
+	vars := mux.Vars(req)
+	req_slug := vars["slug"]
+
+	var query string
+	var resData ArticleResponseData
+
+	// article 쿼리
+	query = fmt.Sprintf("SELECT * FROM article WHERE slug='%s'", req_slug)
+	var article_id int
+	var article ArticleRes
+	var temp_author_id int
+	err := db.QueryRow(query).Scan(&article_id, &article.Slug, &article.Title, &article.Desc, &article.Body, &article.TagList, &article.CreatedAt, &article.UpdatedAt, &article.Favorited, &article.FavoritesCount, &temp_author_id)
+	checkError(err)
+
+	// author 쿼리
+	query = fmt.Sprintf("SELECT * FROM realworld_user WHERE id='%d'", temp_author_id)
+	var author Author
+	err = db.QueryRow(query).Scan(&temp_author_id, &author.Username, &author.Bio, &author.Image, &author.Following)
+	checkError(err)
+
+	// article_id로 favoritesCount 쿼리
+	query = fmt.Sprintf("SELECT count(*) FROM favorite WHERE article_id='%d')", article_id)
+	var favorites_cnt int
+	err = db.QueryRow(query).Scan(&favorites_cnt)
+	checkError(err)
+
+	// response data 기본 정보 입력
+	resData.Article = article
+	resData.Article.Author = author
+
+	// TODO: Authentication 추가 후, 실제 user_id 입력
+	user_id := 1
+	switch req.Method {
+	case "POST":
+		// 해당 user로 favorites 추가
+		_, err = db.Exec("INSERT INTO favorite VALUES (?,?,?)",
+			nil,
+			user_id,
+			article_id,
+		)
+		checkError(err)
+
+		resData.Article.Favorited = true
+		resData.Article.FavoritesCount = favorites_cnt + 1
+		json.NewEncoder(w).Encode(resData)
+
+	case "DELETE":
+		// user_id 및 article_id로 favoritesCount 쿼리
+		query = fmt.Sprintf("SELECT count(*) FROM favorite WHERE user_id='%d' and article_id='%d')", user_id, article_id)
+		var is_favorite int
+		err = db.QueryRow(query).Scan(&is_favorite)
+		checkError(err)
+
+		// 해당 유저가 favorite 등록했다면 DELETE
+		if is_favorite > 0 {
+			_, err = db.Exec("DELETE FROM favorite WHERE user_id=? and article_id=?", user_id, article_id)
+			checkError(err)
+			favorites_cnt -= 1
+		}
+
+		resData.Article.Favorited = false
+		resData.Article.FavoritesCount = favorites_cnt
+		json.NewEncoder(w).Encode(resData)
+	}
+
+}
+
 func handleComment(w http.ResponseWriter, req *http.Request) {
 	fmt.Println("Method : ", req.Method)
 	vars := mux.Vars(req)
@@ -229,13 +307,6 @@ func handleComment(w http.ResponseWriter, req *http.Request) {
 	err := db.QueryRow(query).Scan(&article_id, &article.Slug, &article.Title, &article.Desc, &article.Body, &temp_taglist, &article.CreatedAt, &article.UpdatedAt, &article.Favorited, &article.FavoritesCount, &temp_user_id)
 	checkError(err)
 
-	// article로 user 쿼리
-	query = fmt.Sprintf("SELECT * FROM realworld_user WHERE id=%d", temp_user_id)
-	var user_id int
-	var author Author
-	err = db.QueryRow(query).Scan(&user_id, &author.Username, &author.Bio, &author.Image, &author.Following)
-	checkError(err)
-
 	switch req.Method {
 	case "POST":
 		var reqData CommentRequestData
@@ -243,6 +314,13 @@ func handleComment(w http.ResponseWriter, req *http.Request) {
 		err = json.NewDecoder(req.Body).Decode(&reqData)
 		checkError(err)
 		defer req.Body.Close()
+
+		// TODO: Authentication 추가 후, 실제 user_id 입력
+		user_id := 1
+		query = fmt.Sprintf("SELECT * FROM realworld_user WHERE id=%d", user_id)
+		var author Author
+		err = db.QueryRow(query).Scan(&user_id, &author.Username, &author.Bio, &author.Image, &author.Following)
+		checkError(err)
 
 		resData.Id = article_id
 		resData.CreatedAt = time.Now()
@@ -264,23 +342,38 @@ func handleComment(w http.ResponseWriter, req *http.Request) {
 		var resData CommentList
 
 		// comment 쿼리
-		query = fmt.Sprintf("SELECT id, createdAt, updatedAt, body FROM comment WHERE article_id=%d", article_id)
-		rows, err := db.Query(query)
+		query = fmt.Sprintf("SELECT id, createdAt, updatedAt, body, user_id FROM comment WHERE article_id=%d", article_id)
+		comment_rows, err := db.Query(query)
 		checkError(err)
-		defer rows.Close()
+		defer comment_rows.Close()
+
+		// users: comment마다 조회한 user를 저장해둠. 중복 user는 또다시 쿼리하지 않도록 캐시.
+		users := make(map[int]Author) // map을 사용할때는 make로 초기화하지 않으면 runtime error 발생
 
 		// query를 iterate하면서 comments를 받아놓음
-		for rows.Next() {
+		for comment_rows.Next() {
 			var comment Comment
-			comment.Author = author
-			err := rows.Scan(&comment.Id, &comment.CreatedAt, &comment.UpdatedAt, &comment.Body)
+			var user_id int
+			err := comment_rows.Scan(&comment.Id, &comment.CreatedAt, &comment.UpdatedAt, &comment.Body, &user_id)
 			checkError(err)
+
+			// user_id에 따라 user 탐색
+			var author Author
+			if author, ok := users[user_id]; !ok {
+				query = fmt.Sprintf("SELECT * FROM realworld_user WHERE id=%d", user_id)
+				err = db.QueryRow(query).Scan(&user_id, &author.Username, &author.Bio, &author.Image, &author.Following)
+				checkError(err)
+				users[user_id] = author
+			}
+			comment.Author = author
+
 			resData.Comments = append(resData.Comments, comment)
 		}
 
 		json.NewEncoder(w).Encode(resData)
 
 	case "DELETE":
+		// TODO: Authentication 추가 후, user_id와 해당 comment가 일치하는지 먼저 확인 후 실행
 		comment_id := vars["id"]
 		_, err = db.Exec("DELETE FROM comment WHERE id=?", comment_id)
 		checkError(err)
@@ -288,3 +381,5 @@ func handleComment(w http.ResponseWriter, req *http.Request) {
 		w.Write([]byte("delete completed"))
 	}
 }
+
+func handleTag(w http.ResponseWriter, req *http.Request) {}
