@@ -3,8 +3,11 @@ package main
 import (
 	"database/sql" // 실제 SQL을 수행할 패키지
 	"encoding/json"
+
+	// "errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -155,9 +158,8 @@ func handleArticle(w http.ResponseWriter, req *http.Request) {
 	query = fmt.Sprintf("SELECT * FROM article WHERE slug='%s'", req_slug)
 	var article_id int
 	var article ArticleRes
-	var temp_taglist string
 	var temp_user_id int
-	article_err := db.QueryRow(query).Scan(&article_id, &article.Slug, &article.Title, &article.Desc, &article.Body, &temp_taglist, &article.CreatedAt, &article.UpdatedAt, &article.Favorited, &article.FavoritesCount, &temp_user_id)
+	article_err := db.QueryRow(query).Scan(&article_id, &article.Slug, &article.Title, &article.Desc, &article.Body, &article.CreatedAt, &article.UpdatedAt, &article.Favorited, &article.FavoritesCount, &temp_user_id)
 
 	switch req.Method {
 	case "POST":
@@ -166,13 +168,12 @@ func handleArticle(w http.ResponseWriter, req *http.Request) {
 		if article_err == sql.ErrNoRows {
 			article.CreatedAt = time.Now()
 			article.UpdatedAt = article.CreatedAt
-			_, err = db.Exec("INSERT INTO article VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+			_, err = db.Exec("INSERT INTO article VALUES (?,?,?,?,?,?,?,?,?,?)",
 				nil,
 				req_slug,
 				reqData.Article.Title,
 				reqData.Article.Desc,
 				reqData.Article.Body,
-				"["+strings.Join(reqData.Article.TagList, ",")+"]",
 				article.CreatedAt,
 				article.UpdatedAt,
 				false, // favorited
@@ -180,6 +181,40 @@ func handleArticle(w http.ResponseWriter, req *http.Request) {
 				user_id,
 			)
 			checkError(err)
+
+			// 추가된 article의 id를 조회
+			query = fmt.Sprintf("SELECT * FROM article WHERE slug='%s'", req_slug)
+			err = db.QueryRow(query).Scan(&article_id)
+			checkError(err)
+
+			// INSERT tag
+			for _, tag_name := range reqData.Article.TagList {
+				// tag에 신규 태그 추가 : IGNORE를 줘서 이미 존재하는 태그라면 DUPLICATED KEY 에러를 무시한다.
+				_, err = db.Exec("INSERT IGNORE INTO tag VALUES (?,?)",
+					nil,
+					tag_name,
+				)
+				checkError(err)
+
+				// (deprecated : 잘못된 로직) tag 테이블에 중복 발생 시, article_tag에 INSERT 작업은 무시한다.
+				// var mysqlErr *mysql.MySQLError
+				// if errors.As(err, &mysqlErr) && mysqlErr.Number == 1062 { continue }
+
+				// tag의 id를 다시 조회
+				query = fmt.Sprintf("SELECT id FROM tag WHERE tag_name='%s'", tag_name)
+				var tag_id int
+				err = db.QueryRow(query).Scan(&tag_id)
+				checkError(err)
+
+				// article_tag 테이블에 관계 추가
+				_, err = db.Exec("INSERT INTO article_tag VALUES (?,?,?)",
+					nil,
+					tag_id,
+					article_id,
+				)
+				checkError(err)
+			}
+
 		} else {
 			checkError(article_err)
 			article.UpdatedAt = time.Now()
@@ -202,13 +237,18 @@ func handleArticle(w http.ResponseWriter, req *http.Request) {
 
 	case "GET":
 		checkError(article_err)
+
+		// tag 쿼리
+		tagList := getTags(article_id)
+
 		article.Author = author
-		article.TagList = strings.Split(temp_taglist, ",")
+		article.TagList = tagList
 		resData := &ArticleResponseData{Article: article}
 		json.NewEncoder(w).Encode(resData)
 		// w.Write([]byte("single article"))
 
 	// TODO: optional fields required
+	// TODO: tag 업데이트
 	case "PUT":
 		var reqUpdateData ArticleUpdateData
 		err = json.NewDecoder(req.Body).Decode(&reqUpdateData)
@@ -222,8 +262,12 @@ func handleArticle(w http.ResponseWriter, req *http.Request) {
 		_, err = db.Exec(update_query, reqUpdateData.Article.Title, reqUpdateData.Article.Desc, reqUpdateData.Article.Body, req_slug, article_id)
 		checkError(err)
 	case "DELETE":
+		// article 삭제
 		_, err = db.Exec("DELETE FROM article WHERE id=?", article_id)
 		checkError(err)
+
+		// article_tag에서 tag 관계도 삭제
+		_, err = db.Exec("DELETE FROM article_tag WHERE article_id=?", article_id)
 	}
 }
 
@@ -240,7 +284,7 @@ func handleFavorite(w http.ResponseWriter, req *http.Request) {
 	var article_id int
 	var article ArticleRes
 	var temp_author_id int
-	err := db.QueryRow(query).Scan(&article_id, &article.Slug, &article.Title, &article.Desc, &article.Body, &article.TagList, &article.CreatedAt, &article.UpdatedAt, &article.Favorited, &article.FavoritesCount, &temp_author_id)
+	err := db.QueryRow(query).Scan(&article_id, &article.Slug, &article.Title, &article.Desc, &article.Body, &article.CreatedAt, &article.UpdatedAt, &article.Favorited, &article.FavoritesCount, &temp_author_id)
 	checkError(err)
 
 	// author 쿼리
@@ -306,9 +350,8 @@ func handleComment(w http.ResponseWriter, req *http.Request) {
 	query := fmt.Sprintf("SELECT * FROM article WHERE slug='%s'", req_slug)
 	var article_id int
 	var article ArticleRes
-	var temp_taglist string
 	var temp_user_id int
-	err := db.QueryRow(query).Scan(&article_id, &article.Slug, &article.Title, &article.Desc, &article.Body, &temp_taglist, &article.CreatedAt, &article.UpdatedAt, &article.Favorited, &article.FavoritesCount, &temp_user_id)
+	err := db.QueryRow(query).Scan(&article_id, &article.Slug, &article.Title, &article.Desc, &article.Body, &article.CreatedAt, &article.UpdatedAt, &article.Favorited, &article.FavoritesCount, &temp_user_id)
 	checkError(err)
 
 	switch req.Method {
@@ -388,7 +431,37 @@ func handleComment(w http.ResponseWriter, req *http.Request) {
 
 func handleTag(w http.ResponseWriter, req *http.Request) {
 	// 전체 tag 쿼리
-	query := fmt.Sprintf("SELECT tag_name FROM tag")
+	tagList := getTags()
+
+	var resData TagResponseData
+	resData.Tags = tagList
+
+	json.NewEncoder(w).Encode(resData)
+}
+
+func getTags(article_id ...int) []string {
+	var query string
+
+	if article_id != nil {
+		query = fmt.Sprintf("SELECT tag_id FROM article_tag WHERE article_id='%d'", article_id[0])
+		temp_rows, err := db.Query(query)
+		checkError(err)
+		defer temp_rows.Close()
+
+		var tagIdList []string
+		for temp_rows.Next() {
+			var tag_id int
+			err = temp_rows.Scan(&tag_id)
+			checkError(err)
+			tagIdList = append(tagIdList, strconv.Itoa(tag_id)) // int to string 변환이 특이하다..
+		}
+		tagIds := strings.Join(tagIdList, ",")
+
+		query = fmt.Sprintf("SELECT tag_name FROM tag WHERE id in (%s)", tagIds)
+	} else {
+		query = "SELECT tag_name FROM tag"
+	}
+
 	rows, err := db.Query(query)
 	checkError(err)
 	defer rows.Close()
@@ -397,11 +470,9 @@ func handleTag(w http.ResponseWriter, req *http.Request) {
 	for rows.Next() {
 		var tag_name string
 		err = rows.Scan(&tag_name)
+		checkError(err)
 		tagList = append(tagList, tag_name)
 	}
 
-	var resData TagResponseData
-	resData.Tags = tagList
-
-	json.NewEncoder(w).Encode(resData)
+	return tagList
 }
