@@ -32,6 +32,7 @@ func main() {
 
 	r := mux.NewRouter()
 	r.HandleFunc("/api/articles", handleArticle).Methods("POST")
+	r.HandleFunc("/api/articles", handleListArticle).Methods("GET")
 	r.HandleFunc("/api/articles/{slug}", handleArticle).Methods("GET")
 	r.HandleFunc("/api/articles/{slug}", handleArticle).Methods("PUT")
 	r.HandleFunc("/api/articles/{slug}", handleArticle).Methods("DELETE")
@@ -87,6 +88,10 @@ type ArticleUpdateData struct {
 }
 type ArticleResponseData struct {
 	Article ArticleRes `json:"article"`
+}
+type MultiArticleResponseData struct {
+	Articles []ArticleRes `json:"articles"`
+	Counts   int          `json:"articlesCount"`
 }
 
 type Comment struct {
@@ -297,6 +302,132 @@ func handleArticle(w http.ResponseWriter, req *http.Request) {
 		_, err = db.Exec("DELETE FROM article WHERE id=?", article_id)
 		checkError(err)
 	}
+}
+
+// TODO: 일단은 종류별로 하나의 파라미터만 받는다고 가정한다..
+// TODO: option 조건에 만족하지 않을 때 Error Handling 없음.
+// TODO: 쿼리 string에 모든걸 떠안는 tag, favorite 필터에 대해 JOIN 방식으로 대체해보기..
+// TODO: 최종 결과물인 article SELECT 쿼리 또한 결과물에 Author정보(realworld_user 테이블) JOIN해서 가져오기..
+func handleListArticle(w http.ResponseWriter, req *http.Request) {
+	var limit int64 = 20
+	var offset int64 = 0
+	var err error
+	// Query parameters 받기
+	tag := req.FormValue("tag")             // filter by tag
+	author_name := req.FormValue("author")  // filter by author
+	favorited := req.FormValue("favorited") // favorited artices by this user
+	limit_str := req.FormValue("limit")     // limit number
+	if limit_str != "" {
+		limit, err = strconv.ParseInt(limit_str, 10, 32) // 10진수, 32bit
+		checkError(err)
+	}
+	offset_str := req.FormValue("offset") // offset
+	if offset_str != "" {
+		offset, err = strconv.ParseInt(offset_str, 10, 32) // 10진수, 32bit
+		checkError(err)
+	}
+
+	// article 쿼리 준비
+	query := "SELECT * FROM article"
+	var conditions string
+	if tag != "" || author_name != "" || favorited != "" {
+		query = query + " WHERE"
+		conditions = ""
+	}
+	// tag 필터링
+	if tag != "" {
+		tag_query := fmt.Sprintf("SELECT article_id FROM article_tag WHERE tag_id=(SELECT id FROM tag WHERE tag_name='%s')", tag)
+		tag_rows, err := db.Query(tag_query)
+		checkError(err)
+		defer tag_rows.Close()
+		var article_ids []string
+		var article_id string
+		for tag_rows.Next() {
+			err := tag_rows.Scan(&article_id)
+			checkError(err)
+			article_ids = append(article_ids, fmt.Sprintf("%q", article_id))
+		}
+		if len(article_ids) > 0 {
+			ids_str := strings.Join(article_ids, ",")
+			if conditions != "" {
+				conditions = conditions + " AND"
+			}
+			conditions = conditions + fmt.Sprintf(" id in (%s)", ids_str)
+		}
+	}
+	// favorited user 필터링
+	if favorited != "" {
+		fav_query := fmt.Sprintf("SELECT article_id FROM favorite WHERE user_id=(SELECT id FROM realworld_user WHERE username='%s')", favorited)
+		fav_rows, err := db.Query(fav_query)
+		checkError(err)
+		defer fav_rows.Close()
+		var article_ids []string
+		var article_id string
+		for fav_rows.Next() {
+			err := fav_rows.Scan(&article_id)
+			checkError(err)
+			article_ids = append(article_ids, fmt.Sprintf("%q", article_id))
+		}
+		if len(article_ids) > 0 {
+			ids_str := strings.Join(article_ids, ",")
+			if conditions != "" {
+				conditions = conditions + " AND"
+			}
+			conditions = conditions + fmt.Sprintf(" id in (%s)", ids_str)
+		}
+	}
+	// author 필터링
+	if author_name != "" {
+		author_query := fmt.Sprintf("SELECT id FROM realworld_user WHERE username='%s'", author_name)
+		var author_id int
+		err := db.QueryRow(author_query).Scan(&author_id)
+		checkError(err)
+		if conditions != "" {
+			conditions = conditions + " AND"
+		}
+		conditions = conditions + fmt.Sprintf(" user_id=%d", author_id)
+	}
+	if conditions != "" {
+		query = query + conditions
+	}
+	query = query + fmt.Sprintf(" ORDER BY createdAt DESC LIMIT %d OFFSET %d", limit, offset)
+	rows, err := db.Query(query)
+	checkError(err)
+	defer rows.Close()
+	var resData MultiArticleResponseData
+	article_cnt := 0
+	for rows.Next() {
+		var article ArticleRes
+		var article_id int
+		var author_id int
+		err = rows.Scan(&article_id, &article.Slug, &article.Title, &article.Desc, &article.Body, &article.CreatedAt, &article.UpdatedAt, &author_id)
+		checkError(err)
+
+		// get Tag
+		tag_query := fmt.Sprintf("SELECT tag_name FROM tag WHERE id in (SELECT tag_id FROM article_tag WHERE article_id=%d)", article_id)
+		var tag_names []string
+		var tag_name string
+		tag_rows, err := db.Query(tag_query)
+		checkError(err)
+		for tag_rows.Next() {
+			err = tag_rows.Scan(&tag_name)
+			checkError(err)
+			tag_names = append(tag_names, tag_name)
+		}
+		article.Article.TagList = tag_names
+
+		// get Author
+		author_query := fmt.Sprintf("SELECT * FROM realworld_user WHERE id=%d", author_id)
+		err = db.QueryRow(author_query).Scan(&author_id, &article.Author.Username, &article.Author.Bio, &article.Author.Image, &article.Author.Following)
+		checkError(err)
+
+		// final append
+		resData.Articles = append(resData.Articles, article)
+		article_cnt += 1
+	}
+	resData.Counts = article_cnt
+
+	json.NewEncoder(w).Encode(resData)
 }
 
 func handleFavorite(w http.ResponseWriter, req *http.Request) {
